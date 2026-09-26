@@ -1,14 +1,14 @@
+import json
 import re
 from io import BytesIO
 from typing import Any
 
 import requests
 from docx import Document
-from docx.enum.text import WD_BREAK
 from docx.shared import Cm, Pt
 
 
-SHARE_API_BASE = "https://chatgpt.com/backend-api/share/"
+SHARE_PAGE_BASE = "https://chatgpt.com/share/"
 
 
 class ChatExportError(RuntimeError):
@@ -28,7 +28,6 @@ def get_share_id(value: str) -> str:
     )
     share_id = match.group(1) if match else value
 
-    # Не даём случайно подставить произвольный URL/мусор в API-путь.
     if not re.fullmatch(r"[A-Za-z0-9_-]+", share_id):
         raise ChatExportError("Не удалось распознать shared-ссылку ChatGPT.")
 
@@ -38,6 +37,17 @@ def get_share_id(value: str) -> str:
 def get_message_text(message: dict[str, Any]) -> str:
     content = message.get("content") or {}
     result: list[str] = []
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if not isinstance(content, dict):
+        return ""
+
+    content_type = content.get("content_type")
+    if content_type == "code" and isinstance(content.get("text"), str):
+        language = content.get("language") or ""
+        return f"```{language}\n{content['text']}\n```".strip()
 
     parts = content.get("parts", [])
     if isinstance(parts, list):
@@ -49,6 +59,15 @@ def get_message_text(message: dict[str, Any]) -> str:
                 text = part.get("text")
                 if isinstance(text, str) and text.strip():
                     result.append(text)
+                    continue
+
+                part_type = part.get("content_type") or part.get("type")
+                if part_type in ("image_asset_pointer", "image"):
+                    result.append("[изображение]")
+                elif part_type in ("audio_asset_pointer", "audio_transcription"):
+                    result.append("[аудио]")
+                elif part_type == "file":
+                    result.append("[файл]")
 
     direct_text = content.get("text")
     if not result and isinstance(direct_text, str) and direct_text.strip():
@@ -98,7 +117,7 @@ def get_messages_from_linear(data: dict[str, Any]) -> list[tuple[str, str]]:
 
 def get_messages_from_mapping(data: dict[str, Any]) -> list[tuple[str, str]]:
     mapping = data.get("mapping") or {}
-    if not mapping:
+    if not isinstance(mapping, dict) or not mapping:
         return []
 
     current = data.get("current_node")
@@ -113,13 +132,37 @@ def get_messages_from_mapping(data: dict[str, Any]) -> list[tuple[str, str]]:
             current = node.get("parent")
         nodes.reverse()
     else:
-        nodes = [node for node in mapping.values() if isinstance(node, dict)]
+        roots = [
+            node_id
+            for node_id, node in mapping.items()
+            if isinstance(node, dict) and not node.get("parent")
+        ]
 
-        def message_time(node: dict[str, Any]) -> float:
-            message = node.get("message") or {}
-            return message.get("create_time") or 0
+        if roots:
+            seen: set[str] = set()
 
-        nodes.sort(key=message_time)
+            def walk(node_id: str) -> None:
+                if node_id in seen:
+                    return
+                node = mapping.get(node_id)
+                if not isinstance(node, dict):
+                    return
+                seen.add(node_id)
+                nodes.append(node)
+                for child_id in node.get("children") or []:
+                    if isinstance(child_id, str):
+                        walk(child_id)
+
+            for root_id in roots:
+                walk(root_id)
+        else:
+            nodes = [node for node in mapping.values() if isinstance(node, dict)]
+
+            def message_time(node: dict[str, Any]) -> float:
+                message = node.get("message") or {}
+                return message.get("create_time") or 0
+
+            nodes.sort(key=message_time)
 
     messages: list[tuple[str, str]] = []
     for node in nodes:
@@ -135,10 +178,242 @@ def get_messages_from_mapping(data: dict[str, Any]) -> list[tuple[str, str]]:
     return messages
 
 
+# -----------------------------------------------------------------------------
+# Public share page decoder
+# -----------------------------------------------------------------------------
+
+
+def _read_js_string(source: str, quote_index: int) -> tuple[str, int]:
+    """Читает тело JS-строки, сохраняя escape-последовательности."""
+    if quote_index >= len(source) or source[quote_index] != '"':
+        raise ValueError("Ожидалась JS-строка.")
+
+    i = quote_index + 1
+    out: list[str] = []
+
+    while i < len(source):
+        char = source[i]
+        if char == "\\":
+            if i + 1 < len(source):
+                out.append(source[i : i + 2])
+                i += 2
+                continue
+        if char == '"':
+            return "".join(out), i + 1
+        out.append(char)
+        i += 1
+
+    return "".join(out), i
+
+
+def _extract_turbo_stream(page_html: str) -> str:
+    """Собирает React Router hydration payload из streamController.enqueue(...)."""
+    chunks: list[str] = []
+
+    for match in re.finditer(r"streamController\.enqueue\(", page_html):
+        pos = match.end()
+        while pos < len(page_html) and page_html[pos] in " \r\n\t":
+            pos += 1
+
+        if pos >= len(page_html) or page_html[pos] != '"':
+            continue
+
+        raw, _ = _read_js_string(page_html, pos)
+        try:
+            chunks.append(json.loads('"' + raw + '"'))
+        except json.JSONDecodeError:
+            continue
+
+    return "".join(chunks)
+
+
+class _TurboDecoder:
+    def __init__(self, flat: list[Any], promises: dict[int, Any] | None = None):
+        self.flat = flat
+        self.promises = promises or {}
+        self.memo: dict[int, Any] = {}
+        self.in_progress: set[int] = set()
+
+    def resolve_edge(self, edge: Any) -> Any:
+        if isinstance(edge, bool):
+            return edge
+        if isinstance(edge, int):
+            if edge < 0:
+                return None
+            if edge in self.promises:
+                return self.promises[edge]
+            if 0 <= edge < len(self.flat):
+                return self.resolve_index(edge)
+            return None
+        return edge
+
+    def resolve_index(self, index: int) -> Any:
+        if index in self.memo:
+            return self.memo[index]
+        if index in self.in_progress:
+            return None
+
+        self.in_progress.add(index)
+        node = self.flat[index]
+
+        if isinstance(node, dict):
+            value: dict[str, Any] = {}
+            self.memo[index] = value
+
+            for raw_key, raw_value in node.items():
+                key: Any = raw_key
+                if isinstance(raw_key, str) and raw_key.startswith("_"):
+                    suffix = raw_key[1:]
+                    if suffix.lstrip("-").isdigit():
+                        key = self.resolve_edge(int(suffix))
+
+                if not isinstance(key, str):
+                    key = str(key)
+
+                value[key] = self.resolve_edge(raw_value)
+
+        elif isinstance(node, list):
+            value = []
+            self.memo[index] = value
+            value.extend(self.resolve_edge(item) for item in node)
+        else:
+            value = node
+
+        self.memo[index] = value
+        self.in_progress.discard(index)
+        return value
+
+
+def _decode_promise_lines(lines: list[str]) -> dict[int, Any]:
+    promises: dict[int, Any] = {}
+
+    for line in lines:
+        match = re.match(r"^P(\d+):(.*)$", line)
+        if not match:
+            continue
+
+        promise_index = int(match.group(1))
+        body = match.group(2)
+
+        try:
+            sub_flat = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(sub_flat, list) and sub_flat:
+            try:
+                promises[promise_index] = _TurboDecoder(sub_flat).resolve_index(0)
+            except Exception:
+                promises[promise_index] = sub_flat
+        else:
+            promises[promise_index] = sub_flat
+
+    return promises
+
+
+def _decode_turbo_stream(stream: str) -> Any:
+    if not stream or not stream.strip():
+        raise ValueError("Пустой hydration payload.")
+
+    lines = stream.split("\n")
+    flat = json.loads(lines[0])
+    if not isinstance(flat, list):
+        raise ValueError("Неожиданный формат hydration payload.")
+
+    promises = _decode_promise_lines(lines[1:])
+    return _TurboDecoder(flat, promises).resolve_index(0)
+
+
+def _find_conversation_payload(root: Any) -> dict[str, Any] | None:
+    """Ищет объект разговора по форме, а не по жёсткому пути."""
+    if not isinstance(root, (dict, list)):
+        return None
+
+    stack: list[tuple[Any, int]] = [(root, 0)]
+    seen: set[int] = set()
+
+    while stack:
+        node, depth = stack.pop()
+        if depth > 60:
+            continue
+
+        if isinstance(node, dict):
+            node_id = id(node)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+
+            mapping = node.get("mapping")
+            linear = node.get("linear_conversation")
+            if isinstance(mapping, dict) or isinstance(linear, list):
+                return node
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+
+        elif isinstance(node, list):
+            for value in reversed(node):
+                if isinstance(value, (dict, list)):
+                    stack.append((value, depth + 1))
+
+    return None
+
+
+def _extract_json_script_candidates(page_html: str) -> list[Any]:
+    """Fallback для старых/альтернативных страниц с JSON внутри <script>."""
+    candidates: list[Any] = []
+
+    patterns = [
+        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        r'<script[^>]+type=["\']application/json["\'][^>]*>(.*?)</script>',
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, page_html, flags=re.IGNORECASE | re.DOTALL):
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            try:
+                candidates.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+
+    return candidates
+
+
+def _parse_conversation_from_html(page_html: str) -> dict[str, Any]:
+    # Современный ChatGPT share page: React Router / turbo-stream.
+    stream = _extract_turbo_stream(page_html)
+    if stream:
+        try:
+            root = _decode_turbo_stream(stream)
+            conversation = _find_conversation_payload(root)
+            if conversation is not None:
+                return conversation
+        except (ValueError, json.JSONDecodeError, TypeError, RecursionError):
+            pass
+
+    # Fallback: старые страницы или иной JSON bootstrap.
+    for candidate in _extract_json_script_candidates(page_html):
+        conversation = _find_conversation_payload(candidate)
+        if conversation is not None:
+            return conversation
+
+    raise ChatExportError(
+        "Публичная страница чата загрузилась, но структуру разговора распознать не удалось. "
+        "Возможно, ChatGPT снова изменил формат share-страницы."
+    )
+
+
 def fetch_shared_chat(shared_link: str) -> tuple[str, list[tuple[str, str]]]:
-    """Загружает публичный shared-чат и возвращает название и сообщения."""
+    """
+    Загружает публичную share-страницу ChatGPT и извлекает название и сообщения.
+
+    Важно: это не официальный API. Формат публичной страницы может измениться.
+    """
     share_id = get_share_id(shared_link)
-    api_url = SHARE_API_BASE + share_id
+    page_url = SHARE_PAGE_BASE + share_id
 
     headers = {
         "User-Agent": (
@@ -146,15 +421,21 @@ def fetch_shared_chat(shared_link: str) -> tuple[str, list[tuple[str, str]]]:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/153.0.0.0 Safari/537.36"
         ),
-        "Accept": "application/json,text/plain,*/*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru,en;q=0.9",
     }
 
     try:
-        response = requests.get(api_url, headers=headers, timeout=120)
+        response = requests.get(
+            page_url,
+            headers=headers,
+            timeout=60,
+            allow_redirects=True,
+        )
     except requests.Timeout as exc:
         raise ChatExportError("ChatGPT слишком долго не отвечает. Попробуйте ещё раз.") from exc
     except requests.RequestException as exc:
-        raise ChatExportError("Не удалось подключиться к ChatGPT.") from exc
+        raise ChatExportError("Не удалось подключиться к публичной странице ChatGPT.") from exc
 
     if response.status_code == 404:
         raise ChatExportError(
@@ -163,33 +444,30 @@ def fetch_shared_chat(shared_link: str) -> tuple[str, list[tuple[str, str]]]:
 
     if response.status_code == 403:
         raise ChatExportError(
-            "ChatGPT отклонил запрос (403). Возможно, доступ к внутреннему share API изменился."
+            "ChatGPT не разрешил серверу открыть публичную share-страницу (403). "
+            "Этот способ нельзя надёжно использовать с текущего хостинга."
         )
 
     if response.status_code != 200:
         raise ChatExportError(f"ChatGPT вернул ошибку HTTP {response.status_code}.")
 
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise ChatExportError(
-            "ChatGPT вернул ответ в неожиданном формате. Возможно, структура share API изменилась."
-        ) from exc
+    conversation = _parse_conversation_from_html(response.text)
 
-    title = data.get("title") or "ChatGPT conversation"
+    title = conversation.get("title") or "ChatGPT conversation"
 
     messages: list[tuple[str, str]] = []
-    if data.get("linear_conversation"):
-        messages = get_messages_from_linear(data)
-    if not messages and data.get("mapping"):
-        messages = get_messages_from_mapping(data)
+    if conversation.get("linear_conversation"):
+        messages = get_messages_from_linear(conversation)
+    if not messages and conversation.get("mapping"):
+        messages = get_messages_from_mapping(conversation)
 
     if not messages:
         raise ChatExportError(
-            "Чат загрузился, но текстовые сообщения не найдены. Возможно, структура share API изменилась."
+            "Чат загрузился, но текстовые сообщения не найдены. "
+            "Возможно, формат share-страницы изменился."
         )
 
-    return title, messages
+    return str(title), messages
 
 
 def safe_filename(name: str) -> str:
@@ -240,7 +518,7 @@ def build_docx(title: str, messages: list[tuple[str, str]]) -> bytes:
 
 
 def export_shared_chat(shared_link: str) -> tuple[str, str, int, bytes]:
-    """Полный сценарий: ссылка -> чат -> DOCX."""
+    """Полный сценарий: публичная share-ссылка -> чат -> DOCX."""
     title, messages = fetch_shared_chat(shared_link)
     filename = safe_filename(title) + ".docx"
     docx_bytes = build_docx(title, messages)
